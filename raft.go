@@ -37,6 +37,20 @@ import (
 	"go.uber.org/zap"
 )
 
+// ProposePipe is a wrapper for the propose channel and error channel
+// If ErrorC is not nil, raft propose process will be blocked until the error is read.
+type ProposePipe struct {
+	ProposeC chan string
+	ErrorC   chan error
+}
+
+func (p *ProposePipe) Close() {
+	close(p.ProposeC)
+	if p.ErrorC != nil {
+		close(p.ErrorC)
+	}
+}
+
 type commit struct {
 	data       []string
 	applyDoneC chan<- struct{}
@@ -44,7 +58,8 @@ type commit struct {
 
 // A key-value stream backed by raft
 type raftNode struct {
-	proposeC    <-chan string            // proposed messages (k,v)
+	proposeC    <-chan string // proposed messages (k,v)
+	proposePipe *ProposePipe
 	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
 	commitC     chan<- *commit           // entries committed to log (k,v)
 	errorC      chan<- error             // errors from raft session
@@ -84,14 +99,14 @@ var defaultSnapshotCount uint64 = 10000
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposePipe *ProposePipe,
 	confChangeC <-chan raftpb.ConfChange) (<-chan *commit, <-chan error, <-chan *snap.Snapshotter) {
 
 	commitC := make(chan *commit)
 	errorC := make(chan error)
 
 	rc := &raftNode{
-		proposeC:    proposeC,
+		proposePipe: proposePipe,
 		confChangeC: confChangeC,
 		commitC:     commitC,
 		errorC:      errorC,
@@ -420,14 +435,17 @@ func (rc *raftNode) serveChannels() {
 	go func() {
 		confChangeCount := uint64(0)
 
-		for rc.proposeC != nil && rc.confChangeC != nil {
+		for rc.proposePipe.ProposeC != nil && rc.confChangeC != nil {
 			select {
-			case prop, ok := <-rc.proposeC:
+			case prop, ok := <-rc.proposePipe.ProposeC:
 				if !ok {
-					rc.proposeC = nil
+					rc.proposePipe.ProposeC = nil
 				} else {
 					// blocks until accepted by raft state machine
-					rc.node.Propose(context.TODO(), []byte(prop))
+					err := rc.node.Propose(context.TODO(), []byte(prop))
+					if rc.proposePipe.ErrorC != nil {
+						rc.proposePipe.ErrorC <- err
+					}
 				}
 
 			case cc, ok := <-rc.confChangeC:

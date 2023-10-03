@@ -28,8 +28,7 @@ import (
 
 // a key-value store backed by raft
 type kvstore struct {
-	proposeC    chan<- string // channel for proposing updates
-	proposeErrC <-chan error  // channel for propose results
+	proposePipe *ProposePipe
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
 	snapshotter *snap.Snapshotter
@@ -40,8 +39,8 @@ type kv struct {
 	Val string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
-	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+func newKVStore(snapshotter *snap.Snapshotter, proposePipe *ProposePipe, commitC <-chan *commit, errorC <-chan error) *kvstore {
+	s := &kvstore{proposePipe: proposePipe, kvStore: make(map[string]string), snapshotter: snapshotter}
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
 		log.Panic(err)
@@ -64,12 +63,22 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 	return v, ok
 }
 
-func (s *kvstore) Propose(k string, v string) {
+func (s *kvstore) Propose(k string, v string) error {
 	var buf strings.Builder
 	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
 		log.Fatal(err)
 	}
-	s.proposeC <- buf.String()
+	s.proposePipe.ProposeC <- buf.String()
+
+	// if ErrorC != nil, waiting propose result
+	if s.proposePipe.ErrorC != nil {
+		err := <-s.proposePipe.ErrorC
+		if err != nil {
+			log.Printf("propose error: %v", err)
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
