@@ -19,6 +19,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"log"
+	"metcd/raftnode"
 	"strings"
 	"sync"
 
@@ -28,7 +29,7 @@ import (
 
 // a key-value store backed by raft
 type kvstore struct {
-	proposePipe *ProposePipe
+	proposePipe *raftnode.ProposePipe
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
 	snapshotter *snap.Snapshotter
@@ -39,7 +40,7 @@ type kv struct {
 	Val string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposePipe *ProposePipe, commitC <-chan *commit, errorC <-chan error) *kvstore {
+func newKVStore(snapshotter *snap.Snapshotter, proposePipe *raftnode.ProposePipe, commitC <-chan *raftnode.Commit, errorC <-chan error) *kvstore {
 	s := &kvstore{proposePipe: proposePipe, kvStore: make(map[string]string), snapshotter: snapshotter}
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
@@ -81,7 +82,7 @@ func (s *kvstore) Propose(k string, v string) error {
 	return nil
 }
 
-func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
+func (s *kvstore) readCommits(commitC <-chan *raftnode.Commit, errorC <-chan error) {
 	for commit := range commitC {
 		if commit == nil {
 			// signaled to load snapshot
@@ -98,7 +99,7 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			continue
 		}
 
-		for _, data := range commit.data {
+		for _, data := range commit.Data {
 			var dataKv kv
 			dec := gob.NewDecoder(bytes.NewBufferString(data))
 			if err := dec.Decode(&dataKv); err != nil {
@@ -109,7 +110,7 @@ func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
 			s.kvStore[dataKv.Key] = dataKv.Val
 			s.mu.Unlock()
 		}
-		close(commit.applyDoneC)
+		close(commit.ApplyDoneC)
 	}
 	if err, ok := <-errorC; ok {
 		log.Fatal(err)

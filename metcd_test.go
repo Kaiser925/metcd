@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"metcd/raftnode"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -38,9 +39,9 @@ func getSnapshotFn() (func() ([]byte, error), <-chan struct{}) {
 
 type cluster struct {
 	peers              []string
-	commitC            []<-chan *commit
+	commitC            []<-chan *raftnode.Commit
 	errorC             []<-chan error
-	proposePipe        []*ProposePipe
+	proposePipe        []*raftnode.ProposePipe
 	confChangeC        []chan raftpb.ConfChange
 	snapshotTriggeredC []<-chan struct{}
 }
@@ -54,21 +55,21 @@ func newCluster(n int) *cluster {
 
 	clus := &cluster{
 		peers:              peers,
-		commitC:            make([]<-chan *commit, len(peers)),
+		commitC:            make([]<-chan *raftnode.Commit, len(peers)),
 		errorC:             make([]<-chan error, len(peers)),
-		proposePipe:        make([]*ProposePipe, len(peers)),
+		proposePipe:        make([]*raftnode.ProposePipe, len(peers)),
 		confChangeC:        make([]chan raftpb.ConfChange, len(peers)),
 		snapshotTriggeredC: make([]<-chan struct{}, len(peers)),
 	}
 
 	for i := range clus.peers {
-		os.RemoveAll(fmt.Sprintf("raftexample-%d", i+1))
-		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
+		os.RemoveAll(fmt.Sprintf("metcd-%d", i+1))
+		os.RemoveAll(fmt.Sprintf("metcd-%d-snap", i+1))
 		clus.confChangeC[i] = make(chan raftpb.ConfChange, 1)
 		fn, snapshotTriggeredC := getSnapshotFn()
 		clus.snapshotTriggeredC[i] = snapshotTriggeredC
-		clus.proposePipe[i] = &ProposePipe{ProposeC: make(chan string, 1)}
-		clus.commitC[i], clus.errorC[i], _ = newRaftNode(i+1, clus.peers, false, fn, clus.proposePipe[i], clus.confChangeC[i])
+		clus.proposePipe[i] = &raftnode.ProposePipe{ProposeC: make(chan string, 1)}
+		clus.commitC[i], clus.errorC[i], _ = raftnode.NewRaftNode(i+1, clus.peers, false, fn, clus.proposePipe[i], clus.confChangeC[i])
 	}
 
 	return clus
@@ -88,8 +89,8 @@ func (clus *cluster) Close() (err error) {
 			err = erri
 		}
 		// clean intermediates
-		os.RemoveAll(fmt.Sprintf("raftexample-%d", i+1))
-		os.RemoveAll(fmt.Sprintf("raftexample-%d-snap", i+1))
+		os.RemoveAll(fmt.Sprintf("metcd-%d", i+1))
+		os.RemoveAll(fmt.Sprintf("metcd-%d-snap", i+1))
 	}
 	return err
 }
@@ -111,14 +112,14 @@ func TestProposeOnCommit(t *testing.T) {
 	donec := make(chan struct{})
 	for i := range clus.peers {
 		// feedback for "n" committed entries, then update donec
-		go func(pC chan<- string, cC <-chan *commit, eC <-chan error) {
+		go func(pC chan<- string, cC <-chan *raftnode.Commit, eC <-chan error) {
 			for n := 0; n < 100; n++ {
 				c, ok := <-cC
 				if !ok {
 					pC = nil
 				}
 				select {
-				case pC <- c.data[0]:
+				case pC <- c.Data[0]:
 					continue
 				case err := <-eC:
 					t.Errorf("eC message (%v)", err)
@@ -166,7 +167,7 @@ func TestCloseProposerInflight(t *testing.T) {
 	}()
 
 	// wait for one message
-	if c, ok := <-clus.commitC[0]; !ok || c.data[0] != "foo" {
+	if c, ok := <-clus.commitC[0]; !ok || c.Data[0] != "foo" {
 		t.Fatalf("Commit failed")
 	}
 
@@ -176,7 +177,7 @@ func TestCloseProposerInflight(t *testing.T) {
 func TestPutAndGetKeyValue(t *testing.T) {
 	clusters := []string{"http://127.0.0.1:9021"}
 
-	proposePipe := &ProposePipe{
+	proposePipe := &raftnode.ProposePipe{
 		ProposeC: make(chan string),
 	}
 	defer proposePipe.Close()
@@ -186,7 +187,7 @@ func TestPutAndGetKeyValue(t *testing.T) {
 
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(1, clusters, false, getSnapshot, proposePipe, confChangeC)
+	commitC, errorC, snapshotterReady := raftnode.NewRaftNode(1, clusters, false, getSnapshot, proposePipe, confChangeC)
 
 	kvs = newKVStore(<-snapshotterReady, proposePipe, commitC, errorC)
 
@@ -238,11 +239,11 @@ func TestAddNewNode(t *testing.T) {
 	clus := newCluster(3)
 	defer clus.closeNoErrors(t)
 
-	os.RemoveAll("raftexample-4")
-	os.RemoveAll("raftexample-4-snap")
+	os.RemoveAll("metcd-4")
+	os.RemoveAll("metcd-4-snap")
 	defer func() {
-		os.RemoveAll("raftexample-4")
-		os.RemoveAll("raftexample-4-snap")
+		os.RemoveAll("metcd-4")
+		os.RemoveAll("metcd-4-snap")
 	}()
 
 	newNodeURL := "http://127.0.0.1:10004"
@@ -252,7 +253,7 @@ func TestAddNewNode(t *testing.T) {
 		Context: []byte(newNodeURL),
 	}
 
-	proposePipe := &ProposePipe{
+	proposePipe := &raftnode.ProposePipe{
 		ProposeC: make(chan string),
 	}
 	defer proposePipe.Close()
@@ -260,25 +261,25 @@ func TestAddNewNode(t *testing.T) {
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
-	newRaftNode(4, append(clus.peers, newNodeURL), true, nil, proposePipe, confChangeC)
+	raftnode.NewRaftNode(4, append(clus.peers, newNodeURL), true, nil, proposePipe, confChangeC)
 
 	go func() {
 		proposePipe.ProposeC <- "foo"
 	}()
 
-	if c, ok := <-clus.commitC[0]; !ok || c.data[0] != "foo" {
+	if c, ok := <-clus.commitC[0]; !ok || c.Data[0] != "foo" {
 		t.Fatalf("Commit failed")
 	}
 }
 
 func TestSnapshot(t *testing.T) {
-	prevDefaultSnapshotCount := defaultSnapshotCount
-	prevSnapshotCatchUpEntriesN := snapshotCatchUpEntriesN
-	defaultSnapshotCount = 4
-	snapshotCatchUpEntriesN = 4
+	prevDefaultSnapshotCount := raftnode.DefaultSnapshotCount
+	prevSnapshotCatchUpEntriesN := raftnode.SnapshotCatchUpEntriesN
+	raftnode.DefaultSnapshotCount = 4
+	raftnode.SnapshotCatchUpEntriesN = 4
 	defer func() {
-		defaultSnapshotCount = prevDefaultSnapshotCount
-		snapshotCatchUpEntriesN = prevSnapshotCatchUpEntriesN
+		raftnode.DefaultSnapshotCount = prevDefaultSnapshotCount
+		raftnode.SnapshotCatchUpEntriesN = prevSnapshotCatchUpEntriesN
 	}()
 
 	clus := newCluster(3)
@@ -295,6 +296,6 @@ func TestSnapshot(t *testing.T) {
 		t.Fatalf("snapshot triggered before applying done")
 	default:
 	}
-	close(c.applyDoneC)
+	close(c.ApplyDoneC)
 	<-clus.snapshotTriggeredC[0]
 }

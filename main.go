@@ -16,6 +16,7 @@ package main
 
 import (
 	"flag"
+	"metcd/raftnode"
 	"strings"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
@@ -28,7 +29,7 @@ func main() {
 	join := flag.Bool("join", false, "join an existing cluster")
 	flag.Parse()
 
-	proposePipe := &ProposePipe{
+	proposePipe := &raftnode.ProposePipe{
 		ProposeC: make(chan string),
 		ErrorC:   make(chan error),
 	}
@@ -39,7 +40,7 @@ func main() {
 	// raft provides a commit stream for the proposals from the http api
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposePipe, confChangeC)
+	commitC, errorC, snapshotterReady := raftnode.NewRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposePipe, confChangeC)
 
 	kvs = newKVStore(<-snapshotterReady, proposePipe, commitC, errorC)
 
