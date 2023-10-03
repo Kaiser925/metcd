@@ -69,7 +69,9 @@ func newCluster(n int) *cluster {
 		fn, snapshotTriggeredC := getSnapshotFn()
 		clus.snapshotTriggeredC[i] = snapshotTriggeredC
 		clus.proposePipe[i] = &raftnode.ProposePipe{ProposeC: make(chan string, 1)}
-		clus.commitC[i], clus.errorC[i], _ = raftnode.NewRaftNode(i+1, clus.peers, false, fn, clus.proposePipe[i], clus.confChangeC[i])
+		rc := raftnode.NewRaftNode(i+1, clus.peers, false, fn, clus.proposePipe[i], clus.confChangeC[i])
+		clus.commitC[i] = rc.CommitC()
+		clus.errorC[i] = rc.ErrorC()
 	}
 
 	return clus
@@ -187,9 +189,9 @@ func TestPutAndGetKeyValue(t *testing.T) {
 
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := raftnode.NewRaftNode(1, clusters, false, getSnapshot, proposePipe, confChangeC)
+	rc := raftnode.NewRaftNode(1, clusters, false, getSnapshot, proposePipe, confChangeC)
 
-	kvs = newKVStore(<-snapshotterReady, proposePipe, commitC, errorC)
+	kvs = newKVStore(<-rc.SnapshotterReady(), proposePipe, rc.CommitC(), rc.ErrorC())
 
 	srv := httptest.NewServer(&httpKVAPI{
 		store:       kvs,

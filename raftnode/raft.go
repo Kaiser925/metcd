@@ -47,8 +47,8 @@ type RaftNode struct {
 	proposeC    <-chan string // proposed messages (k,v)
 	proposePipe *ProposePipe
 	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
-	commitC     chan<- *Commit           // entries committed to log (k,v)
-	errorC      chan<- error             // errors from raft session
+	commitC     chan *Commit             // entries committed to log (k,v)
+	errorC      chan error               // errors from raft session
 
 	id          int      // client ID for raft session
 	peers       []string // raft peer URLs
@@ -80,13 +80,10 @@ type RaftNode struct {
 
 var DefaultSnapshotCount uint64 = 10000
 
-// NewRaftNode initiates a raft instance and returns a committed log entry
-// channel and error channel. Proposals for log updates are sent over the
-// provided the proposal channel. All log entries are replayed over the
-// Commit channel, followed by a nil message (to indicate the channel is
-// current), then new log entries. To shutdown, close proposeC and read errorC.
+// NewRaftNode 实例化 RaftNode, 并开始运行实例. 通过关闭 ProposePipe.ProposeC 来停止实例
+// 通过 CommitC(), ErrorC(), SnapshotterReady() 获取提交的日志, 错误以及快照就绪信息.
 func NewRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposePipe *ProposePipe,
-	confChangeC <-chan raftpb.ConfChange) (<-chan *Commit, <-chan error, <-chan *snap.Snapshotter) {
+	confChangeC <-chan raftpb.ConfChange) *RaftNode {
 
 	commitC := make(chan *Commit)
 	errorC := make(chan error)
@@ -113,7 +110,19 @@ func NewRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 		// rest of structure populated after WAL replay
 	}
 	go rc.startRaft()
-	return commitC, errorC, rc.snapshotterReady
+	return rc
+}
+
+func (rc *RaftNode) CommitC() chan *Commit {
+	return rc.commitC
+}
+
+func (rc *RaftNode) ErrorC() chan error {
+	return rc.errorC
+}
+
+func (rc *RaftNode) SnapshotterReady() <-chan *snap.Snapshotter {
+	return rc.snapshotterReady
 }
 
 func (rc *RaftNode) saveSnap(snap raftpb.Snapshot) error {
@@ -122,9 +131,8 @@ func (rc *RaftNode) saveSnap(snap raftpb.Snapshot) error {
 		Term:      snap.Metadata.Term,
 		ConfState: &snap.Metadata.ConfState,
 	}
-	// save the snapshot file before writing the snapshot to the wal.
-	// This makes it possible for the snapshot file to become orphaned, but prevents
-	// a WAL snapshot entry from having no corresponding snapshot file.
+	// 在写入 WAL 前保存快照, 可能会导致孤儿快照, 但是避免了日志项存在快照记录
+	// 实际没有快照文件的情况.
 	if err := rc.snapshotter.SaveSnap(snap); err != nil {
 		return err
 	}
@@ -148,8 +156,7 @@ func (rc *RaftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
 	return nents
 }
 
-// publishEntries writes committed log entries to Commit channel and returns
-// whether all entries could be published.
+// publishEntries 将已提交的日志条目写入 Commit 通道,并返回是否能发布所有的条目
 func (rc *RaftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) {
 	if len(ents) == 0 {
 		return nil, true
@@ -205,27 +212,27 @@ func (rc *RaftNode) loadSnapshot() *raftpb.Snapshot {
 	if wal.Exist(rc.waldir) {
 		walSnaps, err := wal.ValidSnapshotEntries(rc.logger, rc.waldir)
 		if err != nil {
-			log.Fatalf("raftexample: error listing snapshots (%v)", err)
+			log.Fatalf("metcd:error listing snapshots (%v)", err)
 		}
 		snapshot, err := rc.snapshotter.LoadNewestAvailable(walSnaps)
 		if err != nil && err != snap.ErrNoSnapshot {
-			log.Fatalf("raftexample: error loading snapshot (%v)", err)
+			log.Fatalf("metcd:error loading snapshot (%v)", err)
 		}
 		return snapshot
 	}
 	return &raftpb.Snapshot{}
 }
 
-// openWAL returns a WAL ready for reading.
+// openWAL 返回一个可以被读的 WAL
 func (rc *RaftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 	if !wal.Exist(rc.waldir) {
 		if err := os.Mkdir(rc.waldir, 0750); err != nil {
-			log.Fatalf("raftexample: cannot create dir for wal (%v)", err)
+			log.Fatalf("metcd:cannot create dir for wal (%v)", err)
 		}
 
 		w, err := wal.Create(zap.NewExample(), rc.waldir, nil)
 		if err != nil {
-			log.Fatalf("raftexample: create wal error (%v)", err)
+			log.Fatalf("metcd:create wal error (%v)", err)
 		}
 		w.Close()
 	}
@@ -237,20 +244,20 @@ func (rc *RaftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 	log.Printf("loading WAL at term %d and index %d", walsnap.Term, walsnap.Index)
 	w, err := wal.Open(zap.NewExample(), rc.waldir, walsnap)
 	if err != nil {
-		log.Fatalf("raftexample: error loading wal (%v)", err)
+		log.Fatalf("metcd:error loading wal (%v)", err)
 	}
 
 	return w
 }
 
-// replayWAL replays WAL entries into the raft instance.
+// replayWAL 重放日志到 raft 实例
 func (rc *RaftNode) replayWAL() *wal.WAL {
 	log.Printf("replaying WAL of member %d", rc.id)
 	snapshot := rc.loadSnapshot()
 	w := rc.openWAL(snapshot)
 	_, st, ents, err := w.ReadAll()
 	if err != nil {
-		log.Fatalf("raftexample: failed to read WAL (%v)", err)
+		log.Fatalf("metcd:failed to read WAL (%v)", err)
 	}
 	rc.raftStorage = raft.NewMemoryStorage()
 	if snapshot != nil {
@@ -275,7 +282,7 @@ func (rc *RaftNode) writeError(err error) {
 func (rc *RaftNode) startRaft() {
 	if !fileutil.Exist(rc.snapdir) {
 		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
-			log.Fatalf("raftexample: cannot create dir for snapshot (%v)", err)
+			log.Fatalf("metcd:cannot create dir for snapshot (%v)", err)
 		}
 	}
 	rc.snapshotter = snap.New(zap.NewExample(), rc.snapdir)
@@ -427,7 +434,7 @@ func (rc *RaftNode) serveChannels() {
 				if !ok {
 					rc.proposePipe.ProposeC = nil
 				} else {
-					// blocks until accepted by raft state machine
+					// 阻塞直到 raft 状态机接受提案
 					err := rc.node.Propose(context.TODO(), []byte(prop))
 					if rc.proposePipe.ErrorC != nil {
 						rc.proposePipe.ErrorC <- err
@@ -448,16 +455,16 @@ func (rc *RaftNode) serveChannels() {
 		close(rc.stopc)
 	}()
 
-	// event loop on raft state machine updates
+	// 处理 raft 状态机的更新事件
 	for {
 		select {
 		case <-ticker.C:
 			rc.node.Tick()
 
-		// store raft entries to wal, then publish over Commit channel
+		// 将 raft 的 entries 写入 wal，然后通过 Commit channel 发布
 		case rd := <-rc.node.Ready():
-			// Must save the snapshot file and WAL snapshot entry before saving any other entries
-			// or hardstate to ensure that recovery after a snapshot restore is possible.
+			// 保存 snapshot 和 wal snapshot entry，然后再保存其他 entries 和 hardstate
+			// 以确保在 snapshot 恢复后可以恢复
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				rc.saveSnap(rd.Snapshot)
 			}
@@ -487,9 +494,9 @@ func (rc *RaftNode) serveChannels() {
 	}
 }
 
-// When there is a `raftpb.EntryConfChange` after creating the snapshot,
-// then the confState included in the snapshot is out of date. so We need
-// to update the confState before sending a snapshot to a follower.
+// 当在创建快照之后有一个 “raftpb.EntryConfChange时“,
+// 快照中包含的 confState 就是过时的。
+// 所以在给 follower 发送快照之前,需要更新 confState.
 func (rc *RaftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 	for i := 0; i < len(ms); i++ {
 		if ms[i].Type == raftpb.MsgSnap {
@@ -502,19 +509,19 @@ func (rc *RaftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 func (rc *RaftNode) serveRaft() {
 	url, err := url.Parse(rc.peers[rc.id-1])
 	if err != nil {
-		log.Fatalf("raftexample: Failed parsing URL (%v)", err)
+		log.Fatalf("metcd:Failed parsing URL (%v)", err)
 	}
 
 	ln, err := newStoppableListener(url.Host, rc.httpstopc)
 	if err != nil {
-		log.Fatalf("raftexample: Failed to listen rafthttp (%v)", err)
+		log.Fatalf("metcd:Failed to listen rafthttp (%v)", err)
 	}
 
 	err = (&http.Server{Handler: rc.transport.Handler()}).Serve(ln)
 	select {
 	case <-rc.httpstopc:
 	default:
-		log.Fatalf("raftexample: Failed to serve rafthttp (%v)", err)
+		log.Fatalf("metcd:Failed to serve rafthttp (%v)", err)
 	}
 	close(rc.httpdonec)
 }
