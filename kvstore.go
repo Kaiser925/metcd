@@ -105,7 +105,6 @@ func (s *kvstore) readCommits(commitC <-chan *raftnode.Commit, errorC <-chan err
 			if err := dec.Decode(&dataKv); err != nil {
 				log.Fatalf("raftexample: could not decode message (%v)", err)
 			}
-			log.Printf("commit date: %s<-%s", dataKv.Key, dataKv.Val)
 			s.mu.Lock()
 			s.kvStore[dataKv.Key] = dataKv.Val
 			s.mu.Unlock()

@@ -15,8 +15,10 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
+	"metcd/raftnode"
 	"net/http"
 	"strconv"
 
@@ -26,6 +28,7 @@ import (
 // Handler for a http based key-value store backed by raft
 type httpKVAPI struct {
 	store       *kvstore
+	rc          *raftnode.RaftNode
 	confChangeC chan<- raftpb.ConfChange
 }
 
@@ -91,6 +94,10 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// As above, optimistic that raft will apply the conf change
 		w.WriteHeader(http.StatusNoContent)
+	case http.MethodHead:
+		w.Header().Add("X-ID", strconv.FormatUint(h.rc.ID(), 10))
+		w.Header().Add("X-IS-Leader", fmt.Sprintf("%v", h.rc.IsLeader()))
+		w.WriteHeader(http.StatusOK)
 	default:
 		w.Header().Set("Allow", http.MethodPut)
 		w.Header().Add("Allow", http.MethodGet)
@@ -101,12 +108,13 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveHTTPKVAPI starts a key-value server with a GET/PUT API and listens.
-func serveHTTPKVAPI(kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
+func serveHTTPKVAPI(kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange, rc *raftnode.RaftNode) {
 	srv := http.Server{
 		Addr: ":" + strconv.Itoa(port),
 		Handler: &httpKVAPI{
 			store:       kv,
 			confChangeC: confChangeC,
+			rc:          rc,
 		},
 	}
 	go func() {
@@ -116,7 +124,7 @@ func serveHTTPKVAPI(kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange,
 	}()
 
 	// exit when raft goes down
-	if err, ok := <-errorC; ok {
+	if err, ok := <-rc.ErrorC(); ok {
 		log.Fatal(err)
 	}
 }

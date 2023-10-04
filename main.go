@@ -44,5 +44,5 @@ func main() {
 
 	kvs = newKVStore(<-rc.SnapshotterReady(), proposePipe, rc.CommitC(), rc.ErrorC())
 
-	serveHTTPKVAPI(kvs, *kvport, confChangeC, rc.ErrorC())
+	serveHTTPKVAPI(kvs, *kvport, confChangeC, rc)
 }

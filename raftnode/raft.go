@@ -125,6 +125,18 @@ func (rc *RaftNode) SnapshotterReady() <-chan *snap.Snapshotter {
 	return rc.snapshotterReady
 }
 
+func (rc *RaftNode) ID() uint64 {
+	return uint64(rc.id)
+}
+
+func (rc *RaftNode) LeaderID() uint64 {
+	return rc.node.Status().Lead
+}
+
+func (rc *RaftNode) IsLeader() bool {
+	return rc.node.Status().Lead == uint64(rc.id)
+}
+
 func (rc *RaftNode) saveSnap(snap raftpb.Snapshot) error {
 	walSnap := walpb.Snapshot{
 		Index:     snap.Metadata.Index,

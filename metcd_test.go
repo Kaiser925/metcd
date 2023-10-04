@@ -190,7 +190,6 @@ func TestPutAndGetKeyValue(t *testing.T) {
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
 	rc := raftnode.NewRaftNode(1, clusters, false, getSnapshot, proposePipe, confChangeC)
-
 	kvs = newKVStore(<-rc.SnapshotterReady(), proposePipe, rc.CommitC(), rc.ErrorC())
 
 	srv := httptest.NewServer(&httpKVAPI{
