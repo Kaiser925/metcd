@@ -46,10 +46,14 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.store.Propose(key, string(v))
 
-		// Optimistic-- no waiting for ack from raft. Value is not yet
-		// committed so a subsequent GET on the key may return old value
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodGet:
+		err := h.rc.LinearizableReadNotify(r.Context())
+		if err != nil {
+			log.Printf("Failed to read on GET (%v)\n", err)
+			http.Error(w, "Failed on GET", http.StatusBadRequest)
+			return
+		}
 		if v, ok := h.store.Lookup(key); ok {
 			w.Write([]byte(v))
 		} else {

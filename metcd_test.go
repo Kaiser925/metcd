@@ -194,6 +194,7 @@ func TestPutAndGetKeyValue(t *testing.T) {
 
 	srv := httptest.NewServer(&httpKVAPI{
 		store:       kvs,
+		rc:          rc,
 		confChangeC: confChangeC,
 	})
 	defer srv.Close()

@@ -1,13 +1,19 @@
 package raftnode
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
+	"metcd/wait"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/etcd/client/pkg/v3/fileutil"
@@ -19,8 +25,12 @@ import (
 	stats "go.etcd.io/etcd/server/v3/etcdserver/api/v2stats"
 	"go.etcd.io/etcd/server/v3/wal"
 	"go.etcd.io/etcd/server/v3/wal/walpb"
-
 	"go.uber.org/zap"
+)
+
+const (
+	internalTimeout    = time.Second
+	readIndexRetryTime = 500 * time.Millisecond
 )
 
 // ProposePipe is a wrapper for the propose channel and error channel
@@ -44,30 +54,43 @@ type Commit struct {
 
 // RaftNode is a key-value stream backed by raft
 type RaftNode struct {
-	proposeC    <-chan string // proposed messages (k,v)
-	proposePipe *ProposePipe
-	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
-	commitC     chan *Commit             // entries committed to log (k,v)
-	errorC      chan error               // errors from raft session
+	proposePipe *ProposePipe             // 用于接受数据变更提案, 并返回提案结果
+	confChangeC <-chan raftpb.ConfChange // 用于接受集群配置变更的提案
+	commitC     chan *Commit             // 确认记录 (k,v) 的日志项
+	errorC      chan error               // raft 会话返回的错误
 
-	id          int      // client ID for raft session
-	peers       []string // raft peer URLs
-	join        bool     // node is joining an existing cluster
-	waldir      string   // path to WAL directory
-	snapdir     string   // path to snapshot directory
-	getSnapshot func() ([]byte, error)
+	id          int                    // raft 会话中的客户端 ID
+	peers       []string               // raft peer 的 url
+	join        bool                   // 标志节点是加入一个已经存在的集群
+	waldir      string                 // 存放 WAL 日志的目录
+	snapdir     string                 // 存放快照的目录
+	getSnapshot func() ([]byte, error) // 获取快照的方法
+
+	leaderChanged *Notifier // leaderChanged is used to notify the linearizable read loop to drop the old read requests.
+
+	applyWait wait.WaitTime
+
+	readMu sync.RWMutex
+	// read routine notifies that it waits for reading by sending an empty struct to
+	readwaitc chan struct{}
+	// readNotifier is used to Notify the read routine that it can process the request
+	// when there is no error
+	readNotifier *ErrorNotifier
+
+	readStateC chan raft.ReadState
+	idGen      *Generator
 
 	confState     raftpb.ConfState
 	snapshotIndex uint64
 	appliedIndex  uint64
+	lead          uint64 // 当前集群的 Leader ID
 
-	// raft backing for the Commit/error channel
 	node        raft.Node
 	raftStorage *raft.MemoryStorage
 	wal         *wal.WAL
 
 	snapshotter      *snap.Snapshotter
-	snapshotterReady chan *snap.Snapshotter // signals when snapshotter is ready
+	snapshotterReady chan *snap.Snapshotter // 通知 Snapshotter 已经就绪了
 
 	snapCount uint64
 	transport *rafthttp.Transport
@@ -89,20 +112,26 @@ func NewRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 	errorC := make(chan error)
 
 	rc := &RaftNode{
-		proposePipe: proposePipe,
-		confChangeC: confChangeC,
-		commitC:     commitC,
-		errorC:      errorC,
-		id:          id,
-		peers:       peers,
-		join:        join,
-		waldir:      fmt.Sprintf("metcd-%d", id),
-		snapdir:     fmt.Sprintf("metcd-%d-snap", id),
-		getSnapshot: getSnapshot,
-		snapCount:   DefaultSnapshotCount,
-		stopc:       make(chan struct{}),
-		httpstopc:   make(chan struct{}),
-		httpdonec:   make(chan struct{}),
+		proposePipe:   proposePipe,
+		confChangeC:   confChangeC,
+		commitC:       commitC,
+		errorC:        errorC,
+		id:            id,
+		peers:         peers,
+		join:          join,
+		waldir:        fmt.Sprintf("metcd-%d", id),
+		snapdir:       fmt.Sprintf("metcd-%d-snap", id),
+		getSnapshot:   getSnapshot,
+		snapCount:     DefaultSnapshotCount,
+		stopc:         make(chan struct{}),
+		httpstopc:     make(chan struct{}),
+		httpdonec:     make(chan struct{}),
+		leaderChanged: NewNotifier(),
+		readNotifier:  NewErrorNotifier(),
+		readwaitc:     make(chan struct{}, 1),
+		applyWait:     wait.NewTimeList(),
+		readStateC:    make(chan raft.ReadState, 1),
+		idGen:         NewGenerator(uint16(id), time.Now()),
 
 		logger: zap.NewExample(),
 
@@ -113,14 +142,17 @@ func NewRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 	return rc
 }
 
-func (rc *RaftNode) CommitC() chan *Commit {
+// CommitC 返回一个 channel, 用于接收已提交的日志条目
+func (rc *RaftNode) CommitC() <-chan *Commit {
 	return rc.commitC
 }
 
-func (rc *RaftNode) ErrorC() chan error {
+// ErrorC 返回一个 channel, 用于接收错误信息
+func (rc *RaftNode) ErrorC() <-chan error {
 	return rc.errorC
 }
 
+// SnapshotterReady 返回一个 channel, 用于接收快照就绪信息
 func (rc *RaftNode) SnapshotterReady() <-chan *snap.Snapshotter {
 	return rc.snapshotterReady
 }
@@ -130,11 +162,35 @@ func (rc *RaftNode) ID() uint64 {
 }
 
 func (rc *RaftNode) LeaderID() uint64 {
-	return rc.node.Status().Lead
+	return rc.getLead()
 }
 
 func (rc *RaftNode) IsLeader() bool {
-	return rc.node.Status().Lead == uint64(rc.id)
+	return rc.getLead() == uint64(rc.id)
+}
+
+func (rc *RaftNode) setLead(v uint64) {
+	atomic.StoreUint64(&rc.lead, v)
+}
+
+func (rc *RaftNode) getLead() uint64 {
+	return atomic.LoadUint64(&rc.lead)
+}
+
+func (rc *RaftNode) setAppliedIndex(v uint64) {
+	atomic.StoreUint64(&rc.appliedIndex, v)
+}
+
+func (rc *RaftNode) getAppliedIndex() uint64 {
+	return atomic.LoadUint64(&rc.appliedIndex)
+}
+
+func (rc *RaftNode) getSnapshotIndex() uint64 {
+	return atomic.LoadUint64(&rc.snapshotIndex)
+}
+
+func (rc *RaftNode) setSnapshotIndex(v uint64) {
+	atomic.StoreUint64(&rc.snapshotIndex, v)
 }
 
 func (rc *RaftNode) saveSnap(snap raftpb.Snapshot) error {
@@ -159,11 +215,11 @@ func (rc *RaftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
 		return ents
 	}
 	firstIdx := ents[0].Index
-	if firstIdx > rc.appliedIndex+1 {
-		log.Fatalf("first index of committed entry[%d] should <= progress.appliedIndex[%d]+1", firstIdx, rc.appliedIndex)
+	if firstIdx > rc.getAppliedIndex()+1 {
+		log.Fatalf("first index of committed entry[%d] should <= progress.appliedIndex[%d]+1", firstIdx, rc.getAppliedIndex())
 	}
-	if rc.appliedIndex-firstIdx+1 < uint64(len(ents)) {
-		nents = ents[rc.appliedIndex-firstIdx+1:]
+	if rc.getAppliedIndex()-firstIdx+1 < uint64(len(ents)) {
+		nents = ents[rc.getAppliedIndex()-firstIdx+1:]
 	}
 	return nents
 }
@@ -215,7 +271,8 @@ func (rc *RaftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 	}
 
 	// after Commit, update appliedIndex
-	rc.appliedIndex = ents[len(ents)-1].Index
+	rc.setAppliedIndex(ents[len(ents)-1].Index)
+	rc.applyWait.Trigger(rc.getAppliedIndex())
 
 	return applyDoneC, true
 }
@@ -224,18 +281,18 @@ func (rc *RaftNode) loadSnapshot() *raftpb.Snapshot {
 	if wal.Exist(rc.waldir) {
 		walSnaps, err := wal.ValidSnapshotEntries(rc.logger, rc.waldir)
 		if err != nil {
-			log.Fatalf("metcd:error listing snapshots (%v)", err)
+			panic(fmt.Sprintf("listing snapshots (%v)", err))
 		}
 		snapshot, err := rc.snapshotter.LoadNewestAvailable(walSnaps)
 		if err != nil && err != snap.ErrNoSnapshot {
-			log.Fatalf("metcd:error loading snapshot (%v)", err)
+			panic(fmt.Sprintf("loading snapshots (%v)", err))
 		}
 		return snapshot
 	}
 	return &raftpb.Snapshot{}
 }
 
-// openWAL 返回一个可以被读的 WAL
+// openWAL 返回一个用于读取的 WAL
 func (rc *RaftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 	if !wal.Exist(rc.waldir) {
 		if err := os.Mkdir(rc.waldir, 0750); err != nil {
@@ -344,6 +401,7 @@ func (rc *RaftNode) startRaft() {
 
 	go rc.serveRaft()
 	go rc.serveChannels()
+	go rc.linearizableReadLoop()
 }
 
 // stop closes http, closes all channels, and stops raft.
@@ -368,20 +426,21 @@ func (rc *RaftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	log.Printf("publishing snapshot at index %d", rc.snapshotIndex)
 	defer log.Printf("finished publishing snapshot at index %d", rc.snapshotIndex)
 
-	if snapshotToSave.Metadata.Index <= rc.appliedIndex {
-		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d]", snapshotToSave.Metadata.Index, rc.appliedIndex)
+	if snapshotToSave.Metadata.Index <= rc.getAppliedIndex() {
+		panic(fmt.Sprintf("snapshot index [%d] should > progress.appliedIndex [%d]", snapshotToSave.Metadata.Index, rc.getAppliedIndex()))
 	}
 	rc.commitC <- nil // trigger kvstore to load snapshot
 
 	rc.confState = snapshotToSave.Metadata.ConfState
-	rc.snapshotIndex = snapshotToSave.Metadata.Index
-	rc.appliedIndex = snapshotToSave.Metadata.Index
+	rc.setSnapshotIndex(snapshotToSave.Metadata.Index)
+	rc.setAppliedIndex(snapshotToSave.Metadata.Index)
 }
 
 var SnapshotCatchUpEntriesN uint64 = 10000
 
 func (rc *RaftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
-	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
+	appliedIndex, snapshotIndex := rc.getAppliedIndex(), rc.getSnapshotIndex()
+	if appliedIndex-snapshotIndex <= rc.snapCount {
 		return
 	}
 
@@ -394,12 +453,12 @@ func (rc *RaftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 		}
 	}
 
-	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
+	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", appliedIndex, snapshotIndex)
 	data, err := rc.getSnapshot()
 	if err != nil {
 		log.Panic(err)
 	}
-	snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex, &rc.confState, data)
+	snap, err := rc.raftStorage.CreateSnapshot(appliedIndex, &rc.confState, data)
 	if err != nil {
 		panic(err)
 	}
@@ -408,8 +467,8 @@ func (rc *RaftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 	}
 
 	compactIndex := uint64(1)
-	if rc.appliedIndex > SnapshotCatchUpEntriesN {
-		compactIndex = rc.appliedIndex - SnapshotCatchUpEntriesN
+	if appliedIndex > SnapshotCatchUpEntriesN {
+		compactIndex = appliedIndex - SnapshotCatchUpEntriesN
 	}
 	if err := rc.raftStorage.Compact(compactIndex); err != nil {
 		if err != raft.ErrCompacted {
@@ -419,7 +478,7 @@ func (rc *RaftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 		log.Printf("compacted log at index %d", compactIndex)
 	}
 
-	rc.snapshotIndex = rc.appliedIndex
+	rc.setSnapshotIndex(appliedIndex)
 }
 
 func (rc *RaftNode) serveChannels() {
@@ -428,8 +487,8 @@ func (rc *RaftNode) serveChannels() {
 		panic(err)
 	}
 	rc.confState = snap.Metadata.ConfState
-	rc.snapshotIndex = snap.Metadata.Index
-	rc.appliedIndex = snap.Metadata.Index
+	rc.setSnapshotIndex(snap.Metadata.Index)
+	rc.setAppliedIndex(snap.Metadata.Index)
 
 	defer rc.wal.Close()
 
@@ -475,6 +534,27 @@ func (rc *RaftNode) serveChannels() {
 
 		// 将 raft 的 entries 写入 wal，然后通过 Commit channel 发布
 		case rd := <-rc.node.Ready():
+			// 发送了当前的状态信息
+			if rd.SoftState != nil {
+				newLeader := rd.SoftState.Lead != raft.None && rc.getLead() != rd.SoftState.Lead
+				if newLeader {
+					rc.setLead(rd.SoftState.Lead)
+					rc.leaderChanged.Notify() // 通知 leader 发生变更
+				}
+			}
+
+			if len(rd.ReadStates) != 0 {
+				select {
+				case rc.readStateC <- rd.ReadStates[len(rd.ReadStates)-1]:
+				case <-time.After(internalTimeout):
+					rc.logger.Warn("timed out sending read state", zap.Duration("timeout", internalTimeout))
+				case <-rc.stopc:
+					return
+				}
+			}
+
+			// 正常的数据处理
+
 			// 保存 snapshot 和 wal snapshot entry，然后再保存其他 entries 和 hardstate
 			// 以确保在 snapshot 恢复后可以恢复
 			if !raft.IsEmptySnap(rd.Snapshot) {
@@ -506,7 +586,7 @@ func (rc *RaftNode) serveChannels() {
 	}
 }
 
-// 当在创建快照之后有一个 “raftpb.EntryConfChange时“,
+// 如果在创建快照之后有一个 “raftpb.EntryConfChange时“,
 // 快照中包含的 confState 就是过时的。
 // 所以在给 follower 发送快照之前,需要更新 confState.
 func (rc *RaftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
@@ -516,6 +596,134 @@ func (rc *RaftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 		}
 	}
 	return ms
+}
+
+func (rc *RaftNode) LinearizableReadNotify(ctx context.Context) error {
+	return rc.linearizableReadNotify(ctx)
+}
+
+func (rc *RaftNode) linearizableReadNotify(ctx context.Context) error {
+	rc.readMu.RLock()
+	nc := rc.readNotifier
+	rc.readMu.RUnlock()
+
+	// signal linearizable loop for current Notify if it hasn't been already
+	select {
+	case rc.readwaitc <- struct{}{}:
+	default:
+	}
+
+	// wait for read state notification
+	select {
+	case <-nc.Receive():
+		return nc.Error()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-rc.httpdonec:
+		return ErrStopped
+	}
+}
+
+func uint64ToBigEndianBytes(number uint64) []byte {
+	byteResult := make([]byte, 8)
+	binary.BigEndian.PutUint64(byteResult, number)
+	return byteResult
+}
+
+func (rc *RaftNode) linearizableReadLoop() {
+	for {
+		leaderChangedNotifier := rc.leaderChanged.Receive()
+		select {
+		case <-leaderChangedNotifier:
+			continue
+		case <-rc.readwaitc:
+		case <-rc.stopc:
+			return
+		}
+
+		nextnr := NewErrorNotifier()
+		rc.readMu.Lock()
+		nr := rc.readNotifier
+		rc.readNotifier = nextnr
+		rc.readMu.Unlock()
+		confirmedIndex, err := rc.requestCurrentIndex()
+		if err != nil {
+			nr.Notify(err)
+			continue
+		}
+
+		appliedIndex := rc.getAppliedIndex()
+
+		if appliedIndex < confirmedIndex {
+			select {
+			case <-rc.applyWait.Wait(confirmedIndex): // 阻塞线性读, 直到追上 confirmedIndex
+			case <-rc.stopc:
+				return
+			}
+		}
+
+		nr.Notify(nil)
+	}
+}
+
+func (rc *RaftNode) requestCurrentIndex() (uint64, error) {
+	requestId := rc.idGen.Next()
+	err := rc.sendReadIndex(requestId)
+	if err != nil {
+		return 0, err
+	}
+
+	errorTimer := time.NewTimer(5 * time.Second)
+	defer errorTimer.Stop()
+	retryTimer := time.NewTimer(readIndexRetryTime)
+	defer retryTimer.Stop()
+
+	for {
+		select {
+		case rs := <-rc.readStateC: // 读取集群响应的结果
+			requestIdBytes := uint64ToBigEndianBytes(requestId)
+			gotOwnResponse := bytes.Equal(rs.RequestCtx, requestIdBytes)
+			if !gotOwnResponse { // 不是请求的响应, 忽略
+				// a previous request might time out. now we should ignore the response of it and
+				// continue waiting for the response of the current requests.
+				//responseId := uint64(0)
+				//if len(rs.RequestCtx) == 8 {
+				//	responseId = binary.BigEndian.Uint64(rs.RequestCtx)
+				//}
+				//
+				// TODO:(bobby): log slow read requests
+				continue
+			}
+			return rs.Index, nil
+		case <-rc.leaderChanged.Receive(): // 集群 Leader 发生变更, 需要重新请求
+			return 0, ErrLeaderChanged
+		case <-errorTimer.C: // 超时了
+			return 0, ErrTimeout
+		case <-retryTimer.C: // 尝试重新请求
+			if err := rc.sendReadIndex(requestId); err != nil {
+				return 0, err
+			}
+			retryTimer.Reset(readIndexRetryTime)
+			continue
+		case <-rc.stopc:
+			return 0, ErrStopped
+		}
+	}
+}
+
+func (rc *RaftNode) sendReadIndex(requestId uint64) error {
+	ctxToSend := uint64ToBigEndianBytes(requestId)
+
+	cctx, cancel := context.WithTimeout(context.Background(), internalTimeout)
+	err := rc.node.ReadIndex(cctx, ctxToSend)
+	cancel()
+	if errors.Is(err, raft.ErrStopped) {
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (rc *RaftNode) serveRaft() {
